@@ -527,6 +527,14 @@ class TrainMeter:
         self.output_dir = cfg.OUTPUT_DIR
         self.multi_loss = None
 
+        # 冠脉多任务指标
+        self.is_coronary_multitask = cfg.TRAIN.DATASET == "coronary_multitask"
+        if self.is_coronary_multitask:
+            self.mb_cls_loss = ScalarMeter(cfg.LOG_PERIOD)
+            self.mb_reg_loss = ScalarMeter(cfg.LOG_PERIOD)
+            self.cls_loss_total = 0.0
+            self.reg_loss_total = 0.0
+
     def reset(self):
         """
         Reset the Meter.
@@ -542,6 +550,12 @@ class TrainMeter:
         self.num_samples = 0
         if self.multi_loss is not None:
             self.multi_loss.reset()
+
+        if self.is_coronary_multitask:
+            self.mb_cls_loss.reset()
+            self.mb_reg_loss.reset()
+            self.cls_loss_total = 0.0
+            self.reg_loss_total = 0.0
 
     def iter_tic(self):
         """
@@ -562,7 +576,8 @@ class TrainMeter:
         self.net_timer.reset()
 
     def update_stats(
-        self, top1_err, top5_err, loss, lr, grad_norm, mb_size, multi_loss=None
+        self, top1_err, top5_err, loss, lr, grad_norm, mb_size,
+        cls_loss=None, reg_loss=None, multi_loss=None
     ):
         """
         Update the current stats.
@@ -572,6 +587,8 @@ class TrainMeter:
             loss (float): loss value.
             lr (float): learning rate.
             mb_size (int): mini batch size.
+            cls_loss (float, optional): classification loss for coronary multitask.
+            reg_loss (float, optional): regression loss for coronary multitask.
             multi_loss (list): a list of values for multi-tasking losses.
         """
         self.loss.add_value(loss)
@@ -580,13 +597,22 @@ class TrainMeter:
         self.loss_total += loss * mb_size
         self.num_samples += mb_size
 
-        if not self._cfg.DATA.MULTI_LABEL:
-            # Current minibatch stats
-            self.mb_top1_err.add_value(top1_err)
-            self.mb_top5_err.add_value(top5_err)
-            # Aggregate stats
-            self.num_top1_mis += top1_err * mb_size
-            self.num_top5_mis += top5_err * mb_size
+        # 冠脉多任务模式
+        if self.is_coronary_multitask:
+            if cls_loss is not None:
+                self.mb_cls_loss.add_value(cls_loss)
+                self.cls_loss_total += cls_loss * mb_size
+            if reg_loss is not None:
+                self.mb_reg_loss.add_value(reg_loss)
+                self.reg_loss_total += reg_loss * mb_size
+        else:
+            if not self._cfg.DATA.MULTI_LABEL:
+                # Current minibatch stats
+                self.mb_top1_err.add_value(top1_err)
+                self.mb_top5_err.add_value(top5_err)
+                # Aggregate stats
+                self.num_top1_mis += top1_err * mb_size
+                self.num_top5_mis += top5_err * mb_size
         if multi_loss:
             if self.multi_loss is None:
                 self.multi_loss = ListMeter(len(multi_loss))
@@ -631,7 +657,10 @@ class TrainMeter:
             "grad_norm": self.grad_norm,
             "gpu_mem": "{:.2f}G".format(misc.gpu_mem_usage()),
         }
-        if not self._cfg.DATA.MULTI_LABEL:
+        if self.is_coronary_multitask:
+            stats["cls_loss"] = self.mb_cls_loss.get_win_median()
+            stats["reg_loss"] = self.mb_reg_loss.get_win_median()
+        elif not self._cfg.DATA.MULTI_LABEL:
             stats["top1_err"] = self.mb_top1_err.get_win_median()
             stats["top5_err"] = self.mb_top5_err.get_win_median()
         if self.multi_loss is not None:
@@ -662,7 +691,13 @@ class TrainMeter:
             "gpu_mem": "{:.2f}G".format(misc.gpu_mem_usage()),
             "RAM": "{:.2f}/{:.2f}G".format(*misc.cpu_mem_usage()),
         }
-        if not self._cfg.DATA.MULTI_LABEL:
+        if self.is_coronary_multitask:
+            avg_loss = self.loss_total / self.num_samples
+            stats["loss"] = avg_loss
+            if self.num_samples > 0:
+                stats["cls_loss"] = self.cls_loss_total / self.num_samples
+                stats["reg_loss"] = self.reg_loss_total / self.num_samples
+        elif not self._cfg.DATA.MULTI_LABEL:
             top1_err = self.num_top1_mis / self.num_samples
             top5_err = self.num_top5_mis / self.num_samples
             avg_loss = self.loss_total / self.num_samples
@@ -706,6 +741,24 @@ class ValMeter:
         self.all_labels = []
         self.output_dir = cfg.OUTPUT_DIR
 
+        # 冠脉多任务指标
+        self.is_coronary_multitask = cfg.TRAIN.DATASET == "coronary_multitask"
+        if self.is_coronary_multitask:
+            self.mb_loss = ScalarMeter(cfg.LOG_PERIOD)
+            self.mb_cls_loss = ScalarMeter(cfg.LOG_PERIOD)
+            self.mb_reg_loss = ScalarMeter(cfg.LOG_PERIOD)
+            self.mb_cls_accuracy = ScalarMeter(cfg.LOG_PERIOD)
+            self.mb_reg_mae = ScalarMeter(cfg.LOG_PERIOD)
+            self.mb_reg_mse = ScalarMeter(cfg.LOG_PERIOD)
+            # 累计指标
+            self.total_loss = 0.0
+            self.total_cls_loss = 0.0
+            self.total_reg_loss = 0.0
+            self.total_cls_accuracy = 0.0
+            self.total_reg_mae = 0.0
+            self.total_reg_mse = 0.0
+            self.total_samples = 0
+
     def reset(self):
         """
         Reset the Meter.
@@ -720,6 +773,21 @@ class ValMeter:
         self.num_samples = 0
         self.all_preds = []
         self.all_labels = []
+
+        if self.is_coronary_multitask:
+            self.mb_loss.reset()
+            self.mb_cls_loss.reset()
+            self.mb_reg_loss.reset()
+            self.mb_cls_accuracy.reset()
+            self.mb_reg_mae.reset()
+            self.mb_reg_mse.reset()
+            self.total_loss = 0.0
+            self.total_cls_loss = 0.0
+            self.total_reg_loss = 0.0
+            self.total_cls_accuracy = 0.0
+            self.total_reg_mae = 0.0
+            self.total_reg_mse = 0.0
+            self.total_samples = 0
 
     def iter_tic(self):
         """
@@ -739,19 +807,48 @@ class ValMeter:
         self.data_timer.pause()
         self.net_timer.reset()
 
-    def update_stats(self, top1_err, top5_err, mb_size):
+    def update_stats(self, top1_err, top5_err, mb_size, loss=None, cls_loss=None, reg_loss=None,
+                     cls_accuracy=None, reg_mae=None, reg_mse=None):
         """
         Update the current stats.
         Args:
             top1_err (float): top1 error rate.
             top5_err (float): top5 error rate.
             mb_size (int): mini batch size.
+            loss (float, optional): total loss for coronary multitask.
+            cls_loss (float, optional): classification loss for coronary multitask.
+            reg_loss (float, optional): regression loss for coronary multitask.
+            clsaccuracy (float, optional): classification accuracy for coronary multitask.
+            reg_mae (float, optional): regression MAE for coronary multitask.
+            reg_mse (float, optional): regression MSE for coronary multitask.
         """
-        self.mb_top1_err.add_value(top1_err)
-        self.mb_top5_err.add_value(top5_err)
-        self.num_top1_mis += top1_err * mb_size
-        self.num_top5_mis += top5_err * mb_size
-        self.num_samples += mb_size
+        # 冠脉多任务模式
+        if self.is_coronary_multitask:
+            if loss is not None:
+                self.mb_loss.add_value(loss)
+                self.total_loss += loss * mb_size
+            if cls_loss is not None:
+                self.mb_cls_loss.add_value(cls_loss)
+                self.total_cls_loss += cls_loss * mb_size
+            if reg_loss is not None:
+                self.mb_reg_loss.add_value(reg_loss)
+                self.total_reg_loss += reg_loss * mb_size
+            if cls_accuracy is not None:
+                self.mb_cls_accuracy.add_value(cls_accuracy)
+                self.total_cls_accuracy += cls_accuracy * mb_size
+            if reg_mae is not None:
+                self.mb_reg_mae.add_value(reg_mae)
+                self.total_reg_mae += reg_mae * mb_size
+            if reg_mse is not None:
+                self.mb_reg_mse.add_value(reg_mse)
+                self.total_reg_mse += reg_mse * mb_size
+            self.total_samples += mb_size
+        else:
+            self.mb_top1_err.add_value(top1_err)
+            self.mb_top5_err.add_value(top5_err)
+            self.num_top1_mis += top1_err * mb_size
+            self.num_top5_mis += top5_err * mb_size
+            self.num_samples += mb_size
 
     def update_predictions(self, preds, labels):
         """
@@ -783,7 +880,13 @@ class ValMeter:
             "eta": eta,
             "gpu_mem": "{:.2f}G".format(misc.gpu_mem_usage()),
         }
-        if not self._cfg.DATA.MULTI_LABEL:
+        if self.is_coronary_multitask:
+            stats["loss"] = self.mb_loss.get_win_median()
+            stats["cls_loss"] = self.mb_cls_loss.get_win_median()
+            stats["reg_loss"] = self.mb_reg_loss.get_win_median()
+            stats["cls_acc"] = self.mb_cls_accuracy.get_win_median()
+            stats["reg_mae"] = self.mb_reg_mae.get_win_median()
+        elif not self._cfg.DATA.MULTI_LABEL:
             stats["top1_err"] = self.mb_top1_err.get_win_median()
             stats["top5_err"] = self.mb_top5_err.get_win_median()
         logging.log_json_stats(stats)
@@ -801,7 +904,15 @@ class ValMeter:
             "gpu_mem": "{:.2f}G".format(misc.gpu_mem_usage()),
             "RAM": "{:.2f}/{:.2f}G".format(*misc.cpu_mem_usage()),
         }
-        if self._cfg.DATA.MULTI_LABEL:
+        if self.is_coronary_multitask:
+            if self.total_samples > 0:
+                stats["loss"] = self.total_loss / self.total_samples
+                stats["cls_loss"] = self.total_cls_loss / self.total_samples
+                stats["reg_loss"] = self.total_reg_loss / self.total_samples
+                stats["cls_acc"] = self.total_cls_accuracy / self.total_samples
+                stats["reg_mae"] = self.total_reg_mae / self.total_samples
+                stats["reg_mse"] = self.total_reg_mse / self.total_samples
+        elif self._cfg.DATA.MULTI_LABEL:
             stats["map"] = get_map(
                 torch.cat(self.all_preds).cpu().numpy(),
                 torch.cat(self.all_labels).cpu().numpy(),

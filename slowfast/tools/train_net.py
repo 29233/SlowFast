@@ -24,6 +24,8 @@ from slowfast.models.contrastive import (
     contrastive_forward,
     contrastive_parameter_surgery,
 )
+from slowfast.models.coronary_loss import build_coronary_loss
+from slowfast.models.hungarian_loss import build_hungarian_loss
 from slowfast.utils.meters import AVAMeter, EpochTimer, TrainMeter, ValMeter
 from slowfast.utils.multigrid import MultigridSchedule
 
@@ -59,6 +61,12 @@ def train_epoch(
     train_meter.iter_tic()
     data_size = len(train_loader)
 
+    # 检查是否为 coronary_multitask 数据集
+    is_coronary_multitask = cfg.TRAIN.DATASET == "coronary_multitask"
+
+    # 检查是否使用匈牙利损失
+    use_hungarian_loss = is_coronary_multitask and cfg.CORONARY.get('LOSS_TYPE', 'multi_task') == 'hungarian'
+
     if cfg.MIXUP.ENABLE:
         mixup_fn = MixUp(
             mixup_alpha=cfg.MIXUP.ALPHA,
@@ -71,8 +79,16 @@ def train_epoch(
 
     if cfg.MODEL.FROZEN_BN:
         misc.frozen_bn_stats(model)
-    # Explicitly declare reduction to mean.
-    loss_fun = losses.get_loss_func(cfg.MODEL.LOSS_FUNC)(reduction="mean")
+
+    # 为 coronary_multitask 构建专用损失函数
+    if is_coronary_multitask:
+        if use_hungarian_loss:
+            criterion = build_hungarian_loss(cfg)
+        else:
+            criterion = build_coronary_loss(cfg)
+    else:
+        # Explicitly declare reduction to mean.
+        loss_fun = losses.get_loss_func(cfg.MODEL.LOSS_FUNC)(reduction="mean")
 
     for cur_iter, (inputs, labels, index, time, meta) in enumerate(train_loader):
         # Transfer the data to the current GPU device.
@@ -90,12 +106,17 @@ def train_epoch(
                 labels = labels.cuda(non_blocking=True)
                 index = index.cuda(non_blocking=True)
                 time = time.cuda(non_blocking=True)
+            # 处理 metadata 中的字段，仅对张量类型调用 cuda()
             for key, val in meta.items():
-                if isinstance(val, (list,)):
-                    for i in range(len(val)):
-                        val[i] = val[i].cuda(non_blocking=True)
-                else:
+                if isinstance(val, torch.Tensor):
+                    # 张量类型直接转移到 GPU
                     meta[key] = val.cuda(non_blocking=True)
+                elif isinstance(val, list):
+                    # 列表类型：检查元素是否为张量
+                    if len(val) > 0 and isinstance(val[0], torch.Tensor):
+                        for i in range(len(val)):
+                            val[i] = val[i].cuda(non_blocking=True)
+                    # 非张量列表（如 video_id 字符串列表）保留在 CPU 上
 
         batch_size = (
             inputs[0][0].size(0) if isinstance(inputs[0], list) else inputs[0].size(0)
@@ -134,9 +155,21 @@ def train_epoch(
             if cfg.TASK == "ssl" and cfg.MODEL.MODEL_NAME == "ContrastiveModel":
                 labels = torch.zeros(
                     preds.size(0), dtype=labels.dtype, device=labels.device
+
                 )
 
-            if cfg.MODEL.MODEL_NAME == "ContrastiveModel" and partial_loss:
+            # 为 coronary_multitask 计算专用损失
+            if is_coronary_multitask:
+                # 准备 targets 字典
+                targets = {
+                    'cls_targets': meta['cls_target'],
+                    'reg_targets': meta['reg_target'],
+                }
+                if 'valid_mask' in meta:
+                    targets['valid_mask'] = meta['valid_mask']
+                # 计算多任务损失
+                loss, loss_dict = criterion(preds, targets)
+            elif cfg.MODEL.MODEL_NAME == "ContrastiveModel" and partial_loss:
                 loss = partial_loss
             else:
                 # Compute the loss.
@@ -182,7 +215,33 @@ def train_epoch(
             preds[idx_top2] = 0.0
             labels = top_max_k_inds[:, 0]
 
-        if cfg.DETECTION.ENABLE:
+        # 为 coronary_multitask 处理损失统计
+        if is_coronary_multitask:
+            if cfg.NUM_GPUS > 1:
+                loss = du.all_reduce([loss])[0]
+            loss = loss.item()
+            # 从 loss_dict 中提取分类和回归损失
+            cls_loss = loss_dict['cls_loss'].item() if 'cls_loss' in loss_dict else 0.0
+            reg_loss = loss_dict['reg_loss'].item() if 'reg_loss' in loss_dict else 0.0
+
+            # Update and log stats.
+            train_meter.update_stats(
+                top1_err=None, top5_err=None, loss=loss, lr=lr,
+                grad_norm=None, mb_size=batch_size,
+                cls_loss=cls_loss, reg_loss=reg_loss
+            )
+            # write to tensorboard format if available.
+            if writer is not None:
+                writer.add_scalars(
+                    {
+                        "Train/loss": loss,
+                        "Train/cls_loss": cls_loss,
+                        "Train/reg_loss": reg_loss,
+                        "Train/lr": lr
+                    },
+                    global_step=data_size * cur_epoch + cur_iter,
+                )
+        elif cfg.DETECTION.ENABLE:
             if cfg.NUM_GPUS > 1:
                 loss = du.all_reduce([loss])[0]
             loss = loss.item()
@@ -297,6 +356,19 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, train_loader, write
     model.eval()
     val_meter.iter_tic()
 
+    # 检查是否为 coronary_multitask 数据集
+    is_coronary_multitask = cfg.TRAIN.DATASET == "coronary_multitask"
+
+    # 检查是否使用匈牙利损失
+    use_hungarian_loss = is_coronary_multitask and cfg.CORONARY.get('LOSS_TYPE', 'multi_task') == 'hungarian'
+
+    # 为 coronary_multitask 构建专用损失函数
+    if is_coronary_multitask:
+        if use_hungarian_loss:
+            criterion = build_hungarian_loss(cfg)
+        else:
+            criterion = build_coronary_loss(cfg)
+
     for cur_iter, (inputs, labels, index, time, meta) in enumerate(val_loader):
         if cfg.NUM_GPUS:
             # Transferthe data to the current GPU device.
@@ -306,12 +378,17 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, train_loader, write
             else:
                 inputs = inputs.cuda(non_blocking=True)
             labels = labels.cuda()
+            # 处理 metadata 中的字段，仅对张量类型调用 cuda()
             for key, val in meta.items():
-                if isinstance(val, (list,)):
-                    for i in range(len(val)):
-                        val[i] = val[i].cuda(non_blocking=True)
-                else:
+                if isinstance(val, torch.Tensor):
+                    # 张量类型直接转移到 GPU
                     meta[key] = val.cuda(non_blocking=True)
+                elif isinstance(val, list):
+                    # 列表类型：检查元素是否为张量
+                    if len(val) > 0 and isinstance(val[0], torch.Tensor):
+                        for i in range(len(val)):
+                            val[i] = val[i].cuda(non_blocking=True)
+                    # 非张量列表（如 video_id 字符串列表）保留在 CPU 上
             index = index.cuda()
             time = time.cuda()
         batch_size = (
@@ -319,7 +396,65 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, train_loader, write
         )
         val_meter.data_toc()
 
-        if cfg.DETECTION.ENABLE:
+        # 为 coronary_multitask 计算专用损失和指标
+        if is_coronary_multitask:
+            with torch.cuda.amp.autocast(enabled=cfg.TRAIN.MIXED_PRECISION):
+                # Forward pass
+                outputs = model(inputs)
+
+                # 准备 targets 字典
+                targets = {
+                    'cls_targets': meta['cls_target'],
+                    'reg_targets': meta['reg_target'],
+                }
+                if 'valid_mask' in meta:
+                    targets['valid_mask'] = meta['valid_mask']
+
+                # 计算多任务损失
+                loss, loss_dict = criterion(outputs, targets)
+
+            if cfg.NUM_GPUS > 1:
+                loss = du.all_reduce([loss])[0]
+
+            loss = loss.item()
+            cls_loss = loss_dict['cls_loss'].item() if 'cls_loss' in loss_dict else 0.0
+            reg_loss = loss_dict['reg_loss'].item() if 'reg_loss' in loss_dict else 0.0
+
+            # 计算指标
+            if cfg.CORONARY.USE_MULTI_TOKEN:
+                # 对于多 token，对 predictions 取平均
+                cls_pred = torch.stack(outputs['cls_outputs']).mean(0).squeeze(-1)
+                reg_pred = torch.stack(outputs['reg_outputs']).mean(0).squeeze(-1)
+            else:
+                cls_pred = outputs['cls_outputs'][0].squeeze(-1)
+                reg_pred = outputs['reg_outputs'][0].squeeze(-1)
+
+            # 计算分类准确率（使用阈值）
+            # 使用 valid_mask 计算真实目标的平均值（忽略 padding）
+            threshold = cfg.CORONARY.CONFIDENCE_THRESHOLD
+            cls_preds_binary = (cls_pred >= threshold).float()
+
+            valid_mask = meta.get('valid_mask', None)
+            if valid_mask is not None:
+                # 使用 valid_mask 计算加权平均
+                cls_target_mean = (meta['cls_target'] * valid_mask).sum(dim=1) / (valid_mask.sum(dim=1) + 1e-5)
+                reg_target_mean = (meta['reg_target'] * valid_mask).sum(dim=1) / (valid_mask.sum(dim=1) + 1e-5)
+            else:
+                cls_target_mean = meta['cls_target'].mean(dim=1)
+                reg_target_mean = meta['reg_target'].mean(dim=1)
+
+            cls_correct = (cls_preds_binary == cls_target_mean).float().mean().item()
+
+            # 计算回归指标（MAE 和 MSE）
+            reg_mae = torch.abs(reg_pred - reg_target_mean).mean().item()
+            reg_mse = ((reg_pred - reg_target_mean) ** 2).mean().item()
+
+            val_meter.update_stats(
+                top1_err=None, top5_err=None, mb_size=batch_size,
+                loss=loss, cls_loss=cls_loss, reg_loss=reg_loss,
+                cls_accuracy=cls_correct, reg_mae=reg_mae, reg_mse=reg_mse
+            )
+        elif cfg.DETECTION.ENABLE:
             # Compute the predictions.
             preds = model(inputs, meta["boxes"])
             ori_boxes = meta["ori_boxes"]

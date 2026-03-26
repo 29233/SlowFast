@@ -1,0 +1,142 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
+# Configuration for Coronary CT Angiography Multi-Task Learning (Classification + Regression)
+# Uses MViTV2-B model with multi-token output for plaque detection and severity estimation
+
+TRAIN:
+  ENABLE: True
+  DATASET: coronary_multitask
+  BATCH_SIZE: 4
+  EVAL_PERIOD: 5
+  CHECKPOINT_PERIOD: 5
+  AUTO_RESUME: True
+
+DATA:
+  USE_OFFSET_SAMPLING: False
+  DECODING_BACKEND: torchvision
+  NUM_FRAMES: 16
+  SAMPLING_RATE: 1
+  ENABLE_TEMPORAL_SAMPLING: True  # Set to False to load all frames without sampling
+  TRAIN_JITTER_SCALES: [256, 320]
+  TRAIN_CROP_SIZE: 224
+  TEST_CROP_SIZE: 224
+  INPUT_CHANNEL_NUM: [3]
+  PATH_TO_DATA_DIR: /18018998051/data/Central
+  PATH_PREFIX: /18018998051/data/Central/CTA
+  TRAIN_JITTER_SCALES_RELATIVE: [0.08, 1.0]
+  TRAIN_JITTER_ASPECT_RELATIVE: [0.75, 1.3333]
+  MEAN: [0.5, 0.5, 0.5]
+  STD: [0.5, 0.5, 0.5]
+
+MVIT:
+  ZERO_DECAY_POS_CLS: False
+  USE_ABS_POS: False
+  REL_POS_SPATIAL: True
+  REL_POS_TEMPORAL: True
+  DEPTH: 24
+  NUM_HEADS: 1
+  EMBED_DIM: 96
+  PATCH_KERNEL: (3, 7, 7)
+  PATCH_STRIDE: (2, 4, 4)
+  PATCH_PADDING: (1, 3, 3)
+  MLP_RATIO: 4.0
+  QKV_BIAS: True
+  DROPPATH_RATE: 0.2
+  NORM: layernorm
+  MODE: conv
+  CLS_EMBED_ON: True
+  DIM_MUL: [[2, 2.0], [5, 2.0], [21, 2.0]]
+  HEAD_MUL: [[2, 2.0], [5, 2.0], [21, 2.0]]
+  POOL_KVQ_KERNEL: [3, 3, 3]
+  POOL_KV_STRIDE_ADAPTIVE: [1, 8, 8]
+  POOL_Q_STRIDE: [[0, 1, 1, 1], [1, 1, 1, 1], [2, 1, 2, 2], [3, 1, 1, 1], [4, 1, 1, 1], [5, 1, 2, 2], [6, 1, 1, 1], [7, 1, 1, 1], [8, 1, 1, 1], [9, 1, 1, 1], [10, 1, 1, 1], [11, 1, 1, 1], [12, 1, 1, 1], [13, 1, 1, 1], [14, 1, 1, 1], [15, 1, 1, 1], [16, 1, 1, 1], [17, 1, 1, 1], [18, 1, 1, 1], [19, 1, 1, 1], [20, 1, 1, 1], [21, 1, 2, 2], [22, 1, 1, 1], [23, 1, 1, 1]]
+  DROPOUT_RATE: 0.0
+  DIM_MUL_IN_ATT: True
+  RESIDUAL_POOLING: True
+
+AUG:
+  NUM_SAMPLE: 1
+  ENABLE: True
+  COLOR_JITTER: 0.0
+  AA_TYPE: null
+  INTERPOLATION: bicubic
+  RE_PROB: 0.0
+  RE_MODE: pixel
+  RE_COUNT: 0
+  RE_SPLIT: False
+
+MIXUP:
+  ENABLE: False
+  ALPHA: 0.0
+  CUTMIX_ALPHA: 0.0
+  PROB: 0.0
+  SWITCH_PROB: 0.0
+  LABEL_SMOOTH_VALUE: 0.0
+
+SOLVER:
+  ZERO_WD_1D_PARAM: True
+  BASE_LR_SCALE_NUM_SHARDS: True
+  CLIP_GRAD_L2NORM: 1.0
+  BASE_LR: 0.00005
+  COSINE_AFTER_WARMUP: True
+  COSINE_END_LR: 1e-7
+  WARMUP_START_LR: 1e-7
+  WARMUP_EPOCHS: 10.0
+  LR_POLICY: cosine
+  MAX_EPOCH: 100
+  MOMENTUM: 0.9
+  WEIGHT_DECAY: 0.05
+  OPTIMIZING_METHOD: adamw
+
+MODEL:
+  NUM_CLASSES: 1
+  ARCH: mvit
+  MODEL_NAME: MViT
+  LOSS_FUNC: multi_mse
+  DROPOUT_RATE: 0.3
+
+# Coronary Multi-Task Configuration
+CORONARY:
+  # Multi-token output settings
+  USE_MULTI_TOKEN: True          # Set to True for multi-token, False for single-token
+  NUM_PROPOSALS: 10              # Number of proposal tokens (when USE_MULTI_TOKEN=True)
+  CONFIDENCE_THRESHOLD: 0.5      # Threshold for filtering predictions at test time
+
+  # Head architecture
+  CLS_HIDDEN_DIM: 256            # Hidden dimension for classification head
+  REG_HIDDEN_DIM: 256            # Hidden dimension for regression head
+
+  # Loss weights
+  CLS_LOSS_WEIGHT: 1.0           # Weight for classification loss
+  REG_LOSS_WEIGHT: 1.0           # Weight for regression loss
+
+  # Loss type options: 'multi_task', 'focal', 'smooth_l1'
+  LOSS_TYPE: 'multi_task'
+
+  # Focal loss parameters (if LOSS_TYPE='focal')
+  FOCAL_ALPHA: 0.25
+  FOCAL_GAMMA: 2.0
+
+  # Smooth L1 loss parameter (if LOSS_TYPE='smooth_l1')
+  SMOOTH_L1_BETA: 1.0
+
+  # Label smoothing for classification
+  LABEL_SMOOTH: 0.0
+
+  # Data normalization
+  PLAQUE_NORM_FACTOR: 100.0      # Max plaque value for normalization
+
+TEST:
+  ENABLE: True
+  DATASET: coronary_multitask
+  BATCH_SIZE: 8
+  NUM_SPATIAL_CROPS: 1
+  NUM_ENSEMBLE_VIEWS: 1
+
+DATA_LOADER:
+  NUM_WORKERS: 0
+  PIN_MEMORY: False
+
+NUM_GPUS: 1
+NUM_SHARDS: 1
+RNG_SEED: 42
+OUTPUT_DIR: ./outputs/coronary_multitask_mvitt2_b

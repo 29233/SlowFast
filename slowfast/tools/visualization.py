@@ -86,12 +86,17 @@ def run_visualization(vis_loader, model, cfg, writer=None):
             else:
                 inputs = inputs.cuda(non_blocking=True)
             labels = labels.cuda()
+            # 处理 metadata 中的字段，仅对张量类型调用 cuda()
             for key, val in meta.items():
-                if isinstance(val, (list,)):
-                    for i in range(len(val)):
-                        val[i] = val[i].cuda(non_blocking=True)
-                else:
+                if isinstance(val, torch.Tensor):
+                    # 张量类型直接转移到 GPU
                     meta[key] = val.cuda(non_blocking=True)
+                elif isinstance(val, list):
+                    # 列表类型：检查元素是否为张量
+                    if len(val) > 0 and isinstance(val[0], torch.Tensor):
+                        for i in range(len(val)):
+                            val[i] = val[i].cuda(non_blocking=True)
+                    # 非张量列表（如 video_id 字符串列表）保留在 CPU 上
 
         if cfg.DETECTION.ENABLE:
             activations, preds = model_vis.get_activations(inputs, meta["boxes"])

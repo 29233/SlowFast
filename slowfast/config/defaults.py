@@ -706,6 +706,9 @@ _C.DATA.TRAIN_JITTER_ASPECT_RELATIVE = []
 # If True, perform stride length uniform temporal sampling.
 _C.DATA.USE_OFFSET_SAMPLING = False
 
+# If True, enable temporal sampling. If False, load all frames without sampling.
+_C.DATA.ENABLE_TEMPORAL_SAMPLING = True
+
 # Whether to apply motion shift for augmentation.
 _C.DATA.TRAIN_JITTER_MOTION_SHIFT = False
 

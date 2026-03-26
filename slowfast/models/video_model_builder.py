@@ -25,6 +25,7 @@ from torch.nn.init import trunc_normal_
 
 from . import head_helper, operators, resnet_helper, stem_helper  # noqa
 from .build import MODEL_REGISTRY
+from .coronary_head import build_coronary_head
 
 try:
     from fairscale.nn.checkpoint import checkpoint_wrapper
@@ -1042,6 +1043,9 @@ class MViT(nn.Module):
                 act_func=cfg.MODEL.HEAD_ACT,
                 aligned=cfg.DETECTION.ALIGNED,
             )
+        elif cfg.CORONARY.USE_MULTI_TOKEN:
+            # Use Coronary multi-task head for classification and regression
+            self.head = build_coronary_head(embed_dim, cfg)
         else:
             self.head = head_helper.TransformerBasicHead(
                 (
@@ -1077,8 +1081,10 @@ class MViT(nn.Module):
             trunc_normal_(self.cls_token, std=0.02)
         self.apply(self._init_weights)
 
-        self.head.projection.weight.data.mul_(head_init_scale)
-        self.head.projection.bias.data.mul_(head_init_scale)
+        # Only apply head_init_scale for heads with projection attribute
+        if hasattr(self.head, "projection"):
+            self.head.projection.weight.data.mul_(head_init_scale)
+            self.head.projection.bias.data.mul_(head_init_scale)
 
         self.feat_size, self.feat_stride = calc_mvit_feature_geometry(cfg)
 
@@ -1226,6 +1232,16 @@ class MViT(nn.Module):
                 x = x.transpose(1, 2).reshape(B, C, thw[0], thw[1], thw[2])
 
                 x = self.head([x], bboxes)
+
+            elif self.cfg.CORONARY.USE_MULTI_TOKEN:
+                # Coronary multi-task mode
+                if self.cls_embed_on:
+                    x = self.norm(x)
+                    x = x[:, 0]  # Use class token
+                else:
+                    x = self.norm(x)
+                    x = x.mean(1)
+                x = self.head(x)  # Returns dict with cls_outputs and reg_outputs
 
             else:
                 if self.use_mean_pooling:

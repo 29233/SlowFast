@@ -4,6 +4,7 @@
 from .ava_dataset import Ava  # noqa
 from .build import build_dataset, DATASET_REGISTRY  # noqa
 from .charades import Charades  # noqa
+from .coronary import Coronary  # noqa
 from .imagenet import Imagenet  # noqa
 from .kinetics import Kinetics  # noqa
 from .ssv2 import Ssv2  # noqa
