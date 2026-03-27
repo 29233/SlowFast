@@ -16,6 +16,7 @@ import slowfast.utils.metrics as metrics
 import slowfast.utils.misc as misc
 import slowfast.visualization.tensorboard_vis as tb
 import torch
+import torch.nn.functional as F
 from fvcore.nn.precise_bn import get_bn_modules, update_bn_stats
 from slowfast.datasets import loader
 from slowfast.datasets.mixup import MixUp
@@ -25,11 +26,146 @@ from slowfast.models.contrastive import (
     contrastive_parameter_surgery,
 )
 from slowfast.models.coronary_loss import build_coronary_loss
-from slowfast.models.hungarian_loss import build_hungarian_loss
+from slowfast.models.hungarian_loss import build_hungarian_loss, HungarianMatcher
 from slowfast.utils.meters import AVAMeter, EpochTimer, TrainMeter, ValMeter
 from slowfast.utils.multigrid import MultigridSchedule
 
 logger = logging.get_logger(__name__)
+
+
+def compute_ap_for_single_sample(cls_probs, reg_preds, cls_gts, reg_gts, thresholds, num_branches):
+    """
+    Compute mAP for a single sample.
+
+    Args:
+        cls_probs: [N, num_classes] tensor of class probabilities
+        reg_preds: [N] tensor of regression predictions
+        cls_gts: [N] tensor of class ground truth (0-3: foreground, 4: background)
+        reg_gts: [N] tensor of regression ground truth
+        thresholds: List of regression error thresholds for matching
+        num_branches: Number of branch classes (default 4)
+
+    Returns:
+        ap_per_class: Dict of AP values for each class
+        tp_total: Total TP count across all thresholds
+        fp_total: Total FP count across all thresholds
+        fn_total: Total FN count across all thresholds
+        reg_errors: List of matched regression errors
+    """
+    num_proposals = cls_probs.shape[0]
+
+    # Collect predictions and ground truths for each class
+    all_preds_per_class = {c: [] for c in range(num_branches)}
+    all_gts_per_class = {c: [] for c in range(num_branches)}
+
+    # Collect ground truths (only foreground classes 0-3)
+    for n in range(num_proposals):
+        c = int(cls_gts[n].item())
+        if c < num_branches:  # Foreground class
+            all_gts_per_class[c].append((reg_gts[n].item(), n))
+
+    # Collect predictions
+    for p_idx in range(num_proposals):
+        cls_prob = cls_probs[p_idx]  # [num_classes]
+        cls_class = cls_prob.argmax().item()
+        cls_conf = cls_prob.max().item()
+        reg_pred_val = reg_preds[p_idx].item()
+
+        if cls_class < num_branches:  # Only foreground predictions
+            all_preds_per_class[cls_class].append((cls_conf, reg_pred_val, p_idx))
+
+    # Sort predictions by confidence (descending) for each class
+    for c in range(num_branches):
+        all_preds_per_class[c].sort(key=lambda x: -x[0])
+
+    # Compute AP for each class
+    ap_per_class = {}
+    tp_total = 0.0
+    fp_total = 0.0
+    fn_total = 0.0
+    reg_errors = []
+
+    for c in range(num_branches):
+        all_preds_c = all_preds_per_class[c]
+        all_gts_c = all_gts_per_class[c]
+        num_gts = len(all_gts_c)
+
+        if num_gts == 0:
+            ap_per_class[c] = 0.0
+            continue
+
+        # Match predictions with ground truths using average threshold
+        avg_thresh = sum(thresholds) / len(thresholds)
+        matched_gt = set()
+
+        for conf, reg_pred, p_idx in all_preds_c:
+            # Find closest unmatched GT
+            best_dist = float('inf')
+            best_gt_idx = -1
+
+            for gt_idx, (reg_gt, gt_n) in enumerate(all_gts_c):
+                if gt_n not in matched_gt:
+                    dist = abs(reg_pred - reg_gt)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_gt_idx = gt_idx
+
+            if best_dist <= avg_thresh and best_gt_idx >= 0:
+                tp_total += 1
+                matched_gt.add(all_gts_c[best_gt_idx][1])
+                reg_errors.append(best_dist)
+            else:
+                fp_total += 1
+
+        fn_total += num_gts - len(matched_gt)
+
+        # Compute AP using 11-point interpolation
+        if len(thresholds) > 0:
+            ap_values = []
+            for thresh in thresholds:
+                matched_gt_thresh = set()
+                tp_list = []
+                fp_list = []
+
+                for conf, reg_pred, p_idx in all_preds_c:
+                    best_dist = float('inf')
+                    best_gt_idx = -1
+
+                    for gt_idx, (reg_gt, gt_n) in enumerate(all_gts_c):
+                        if gt_n not in matched_gt_thresh:
+                            dist = abs(reg_pred - reg_gt)
+                            if dist < best_dist:
+                                best_dist = dist
+                                best_gt_idx = gt_idx
+
+                    if best_dist <= thresh and best_gt_idx >= 0:
+                        matched_gt_thresh.add(all_gts_c[best_gt_idx][1])
+                        tp_list.append(1)
+                        fp_list.append(0)
+                    else:
+                        tp_list.append(0)
+                        fp_list.append(1)
+
+                tp_cumsum = np.cumsum(tp_list)
+                fp_cumsum = np.cumsum(fp_list)
+
+                # 11-point interpolation
+                recall_points = np.linspace(0, 1, 11)
+                precision_values = []
+                for r_target in recall_points:
+                    valid_indices = tp_cumsum / num_gts >= r_target
+                    if valid_indices.any():
+                        precision_values.append((tp_cumsum[valid_indices] / (tp_cumsum[valid_indices] + fp_cumsum[valid_indices] + 1e-5)).max())
+                    else:
+                        precision_values.append(0.0)
+
+                ap_values.append(np.mean(precision_values))
+
+            ap_per_class[c] = np.mean(ap_values)
+        else:
+            ap_per_class[c] = 0.0
+
+    return ap_per_class, tp_total, fp_total, fn_total, reg_errors
 
 
 def train_epoch(
@@ -420,39 +556,177 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, train_loader, write
             cls_loss = loss_dict['cls_loss'].item() if 'cls_loss' in loss_dict else 0.0
             reg_loss = loss_dict['reg_loss'].item() if 'reg_loss' in loss_dict else 0.0
 
-            # 计算指标
-            if cfg.CORONARY.USE_MULTI_TOKEN:
-                # 对于多 token，对 predictions 取平均
-                cls_pred = torch.stack(outputs['cls_outputs']).mean(0).squeeze(-1)
-                reg_pred = torch.stack(outputs['reg_outputs']).mean(0).squeeze(-1)
+            # =====================
+            # 多标签分类 + 回归任务评价指标
+            # =====================
+            # 模型输出：
+            #   - cls_outputs: [B, N, num_classes] logits (num_classes = 5: 4 branches + 1 background)
+            #   - reg_outputs: [B, N] regression values
+            #
+            # 评估策略：
+            #   - 多 token 模式 (USE_MULTI_TOKEN=True): 类似 DETR，使用 mAP 评估
+            #   - 单 token 模式：直接逐位置比较
+            # =====================
+
+            num_classes = cfg.CORONARY.get('NUM_BRANCHES', 4) + 1  # 5 classes
+            num_proposals = cfg.CORONARY.NUM_PROPOSALS
+            num_branches = cfg.CORONARY.get('NUM_BRANCHES', 4)
+
+            # 获取预测结果（新的张量格式）
+            cls_outputs = outputs['cls_outputs']  # [B, N, num_classes]
+            reg_outputs = outputs['reg_outputs']  # [B, N]
+
+            # 获取真实标签
+            cls_targets = meta['cls_target']  # [B, N] (0-3: foreground, 4: background)
+            reg_targets = meta['reg_target']  # [B, N]
+            valid_mask = meta.get('valid_mask', torch.ones_like(cls_targets).float())  # [B, N]
+
+            if cfg.CORONARY.USE_MULTI_TOKEN and cls_outputs.shape[1] == num_proposals:
+                # =====================
+                # 多 token 模式：mAP 评估（类似 DETR）
+                # =====================
+                # 逐样本计算 mAP，然后汇总
+                # 匹配规则：类别一致 + 回归误差小于阈值
+
+                # 误差阈值列表 (类似 COCO)
+                reg_thresholds = [0.05, 0.10, 0.15, 0.20, 0.25]
+
+                # 逐样本处理并汇总结果
+                total_map = 0.0
+                total_tp = 0.0
+                total_fp = 0.0
+                total_fn = 0.0
+                all_reg_errors = []
+                per_class_correct = [0.0] * num_branches
+                per_class_count = [0.0] * num_branches
+
+                for b in range(batch_size):
+                    mask_b = valid_mask[b]
+                    cls_gts_b = cls_targets[b]  # [N]
+                    reg_gts_b = reg_targets[b]  # [N]
+                    cls_probs_b = F.softmax(cls_outputs[b], dim=-1)  # [N, num_classes]
+                    reg_preds_b = reg_outputs[b]  # [N]
+
+                    # 计算该样本的 mAP（函数内部只处理 foreground 类别）
+                    ap_per_class, tp, fp, fn, reg_errors = compute_ap_for_single_sample(
+                        cls_probs_b, reg_preds_b, cls_gts_b, reg_gts_b,
+                        reg_thresholds, num_branches,
+                    )
+
+                    # 汇总结果
+                    sample_map = np.mean([ap_per_class[c] for c in range(num_branches)])
+                    total_map += sample_map
+                    total_tp += tp
+                    total_fp += fp
+                    total_fn += fn
+                    all_reg_errors.extend(reg_errors)
+
+                    # 统计每个类别的真实目标数量
+                    for c in range(num_branches):
+                        count = ((cls_gts_b == c).float() * mask_b).sum().item()
+                        per_class_count[c] += count
+                        per_class_correct[c] += ap_per_class[c] * count
+
+                # 计算平均 mAP
+                map_value = total_map / batch_size
+
+                # 精确率、召回率、F1
+                precision_overall = total_tp / (total_tp + total_fp + 1e-5)
+                recall_overall = total_tp / (total_tp + total_fn + 1e-5)
+                f1_overall = 2 * precision_overall * recall_overall / (precision_overall + recall_overall + 1e-5)
+
+                # 分类准确率（使用匹配结果）
+                total_valid = (valid_mask > 0).sum().item()
+                cls_accuracy = total_tp / max(total_valid, 1)
+
+                # 前景分类准确率
+                total_fg = sum(per_class_count)
+                cls_accuracy_fg = total_tp / max(total_fg, 1)
+
+                # 回归指标
+                if len(all_reg_errors) > 0:
+                    reg_mae = sum(all_reg_errors) / len(all_reg_errors)
+                    reg_mse = sum(e ** 2 for e in all_reg_errors) / len(all_reg_errors)
+                    reg_rmse = math.sqrt(reg_mse)
+                else:
+                    reg_mae = 0.0
+                    reg_mse = 0.0
+                    reg_rmse = 0.0
+
+                # 计算每个类别的平均准确率
+                per_class_correct = [per_class_correct[c] / max(per_class_count[c], 1) for c in range(num_branches)]
+                per_class_count = per_class_count  # 已经是列表
+
             else:
-                cls_pred = outputs['cls_outputs'][0].squeeze(-1)
-                reg_pred = outputs['reg_outputs'][0].squeeze(-1)
+                # =====================
+                # 单 token 模式：直接逐位置比较
+                # =====================
+                # cls_outputs 已经是 [B, 1, num_classes] 格式
+                cls_logits = cls_outputs  # [B, 1, num_classes]
+                reg_pred = reg_outputs  # [B, 1]
 
-            # 计算分类准确率（使用阈值）
-            # 使用 valid_mask 计算真实目标的平均值（忽略 padding）
-            threshold = cfg.CORONARY.CONFIDENCE_THRESHOLD
-            cls_preds_binary = (cls_pred >= threshold).float()
+                # 分类预测
+                cls_probs = F.softmax(cls_logits, dim=-1)
+                cls_pred_classes = cls_probs.argmax(dim=-1)
 
-            valid_mask = meta.get('valid_mask', None)
-            if valid_mask is not None:
-                # 使用 valid_mask 计算加权平均
-                cls_target_mean = (meta['cls_target'] * valid_mask).sum(dim=1) / (valid_mask.sum(dim=1) + 1e-5)
-                reg_target_mean = (meta['reg_target'] * valid_mask).sum(dim=1) / (valid_mask.sum(dim=1) + 1e-5)
-            else:
-                cls_target_mean = meta['cls_target'].mean(dim=1)
-                reg_target_mean = meta['reg_target'].mean(dim=1)
+                # 分类准确率
+                cls_correct = (cls_pred_classes == cls_targets).float() * valid_mask
+                cls_accuracy = cls_correct.sum() / (valid_mask.sum() + 1e-5)
 
-            cls_correct = (cls_preds_binary == cls_target_mean).float().mean().item()
+                # 前景分类准确率
+                foreground_mask = (cls_targets < num_classes - 1).float() * valid_mask
+                cls_correct_fg = (cls_pred_classes == cls_targets).float() * foreground_mask
+                cls_accuracy_fg = cls_correct_fg.sum() / (foreground_mask.sum() + 1e-5)
 
-            # 计算回归指标（MAE 和 MSE）
-            reg_mae = torch.abs(reg_pred - reg_target_mean).mean().item()
-            reg_mse = ((reg_pred - reg_target_mean) ** 2).mean().item()
+                # 每个分支类别的准确率
+                per_class_correct = []
+                per_class_count = []
+                for c in range(num_branches):
+                    class_mask = (cls_targets == c).float() * valid_mask
+                    class_correct = (cls_pred_classes == cls_targets).float() * class_mask
+                    per_class_correct.append(class_correct.sum().item())
+                    per_class_count.append(class_mask.sum().item())
 
+                # 前景召回率
+                pred_foreground_mask = (cls_pred_classes < num_classes - 1).float()
+                true_positive = (pred_foreground_mask * foreground_mask).sum()
+                pred_positive = pred_foreground_mask.sum()
+                gt_positive = foreground_mask.sum()
+
+                precision_overall = true_positive / (pred_positive + 1e-5)
+                recall_overall = true_positive / (gt_positive + 1e-5)
+                f1_overall = 2 * precision_overall * recall_overall / (precision_overall + recall_overall + 1e-5)
+
+                # 回归指标
+                if foreground_mask.sum() > 0:
+                    reg_mae = (torch.abs(reg_pred - reg_targets) * foreground_mask).sum() / foreground_mask.sum()
+                    reg_mse = ((reg_pred - reg_targets) ** 2 * foreground_mask).sum() / foreground_mask.sum()
+                    reg_rmse = torch.sqrt(reg_mse)
+                else:
+                    reg_mae = torch.tensor(0.0)
+                    reg_mse = torch.tensor(0.0)
+                    reg_rmse = torch.tensor(0.0)
+
+                # mAP 在单 token 模式下用类别平均准确率代替
+                map_value = cls_accuracy.item()
+                ap_per_class = {c: per_class_correct[c] / (per_class_count[c] + 1e-5) for c in range(num_branches)}
+
+            # =====================
+            # 记录指标
+            # =====================
             val_meter.update_stats(
                 top1_err=None, top5_err=None, mb_size=batch_size,
                 loss=loss, cls_loss=cls_loss, reg_loss=reg_loss,
-                cls_accuracy=cls_correct, reg_mae=reg_mae, reg_mse=reg_mse
+                cls_accuracy=cls_accuracy if isinstance(cls_accuracy, float) else cls_accuracy.item(),
+                cls_accuracy_fg=cls_accuracy_fg if isinstance(cls_accuracy_fg, float) else cls_accuracy_fg.item(),
+                precision=precision_overall,
+                recall=recall_overall,
+                f1_score=f1_overall,
+                reg_mae=reg_mae if isinstance(reg_mae, float) else reg_mae.item(),
+                reg_mse=reg_mse if isinstance(reg_mse, float) else reg_mse.item(),
+                reg_rmse=reg_rmse if isinstance(reg_rmse, float) else reg_rmse.item(),
+                per_class_correct=per_class_correct,
+                per_class_count=per_class_count,
             )
         elif cfg.DETECTION.ENABLE:
             # Compute the predictions.
@@ -789,16 +1063,16 @@ def train(cfg):
             train_loader.dataset._set_epoch_num(cur_epoch)
         # Train for one epoch.
         epoch_timer.epoch_tic()
-        train_epoch(
-            train_loader,
-            model,
-            optimizer,
-            scaler,
-            train_meter,
-            cur_epoch,
-            cfg,
-            writer,
-        )
+        # train_epoch(
+        #     train_loader,
+        #     model,
+        #     optimizer,
+        #     scaler,
+        #     train_meter,
+        #     cur_epoch,
+        #     cfg,
+        #     writer,
+        # )
         epoch_timer.epoch_toc()
         logger.info(
             f"Epoch {cur_epoch} takes {epoch_timer.last_epoch_time():.2f}s. Epochs "
